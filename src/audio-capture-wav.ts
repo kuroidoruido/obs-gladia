@@ -31,6 +31,27 @@ const GLADIA_API_KEY = process.env.GLADIA_API_KEY || "";
 const TEST_MODE = process.env.TEST_MODE === 'true' || false;
 const DEBUG = process.env.DEBUG === 'true' || false;
 const OUTPUT_FILE = process.env.OUTPUT_FILE || 'output.wav';
+const CUSTOM_VOCAB_FILE = process.env.CUSTOM_VOCAB_FILE || '../data/custom-words/angular-devs.json';
+
+function loadCustomVocabulary(): string[] {
+  try {
+    const fileUrl = new URL(CUSTOM_VOCAB_FILE, import.meta.url);
+    const fileContent = fs.readFileSync(fileUrl, 'utf8');
+    const parsed = JSON.parse(fileContent);
+
+    if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === 'string')) {
+      console.warn(`⚠️ Le fichier de vocabulaire personnalisé ${CUSTOM_VOCAB_FILE} n'est pas un tableau de chaînes. Utilisation du vocabulaire par défaut.`);
+      return ['Angular', 'Signals', 'RxJS', 'TypeScript', 'JavaScript', 'Node.js', 'code', 'script', 'file'];
+    }
+
+    return parsed;
+  } catch (error) {
+    console.warn(`⚠️ Impossible de charger le fichier de vocabulaire personnalisé ${CUSTOM_VOCAB_FILE}:`, error);
+    return ['Angular', 'Signals', 'RxJS', 'TypeScript', 'JavaScript', 'Node.js', 'code', 'script', 'file'];
+  }
+}
+
+const CUSTOM_VOCABULARY = loadCustomVocabulary();
 
 // --- Types ---
 type AudioChunk = Buffer;
@@ -73,20 +94,24 @@ async function initializeGladiaSession(): Promise<{ id: string; url: string }> {
         model: 'solaria-1',
         endpointing: 0.05,
         maximum_duration_without_endpointing: 5,
-        language_config: { languages: ['fr'], code_switching: false },
+        language_config: { languages: ['fr', 'en'], code_switching: true },
         pre_processing: { audio_enhancer: false, speech_threshold: 0.6 },
         realtime_processing: {
-          custom_vocabulary: false,
           custom_spelling: false,
-          translation: false,
           named_entity_recognition: false,
           sentiment_analysis: false,
+          translation: false,
           translation_config: {
-            model: 'base',
-            match_original_utterances: true,
-            lipsync: true,
-            context_adaptation: true,
-            informal: false
+            model: 'base',//'enhanced',//'base',
+            // match_original_utterances: true,
+            // lipsync: false,
+            // context_adaptation: true,
+            // informal: false
+            target_languages: ['fr'],
+          },
+          custom_vocabulary: true,
+          custom_vocabulary_config: {
+            vocabulary: CUSTOM_VOCABULARY,
           }
         },
         post_processing: {
@@ -185,6 +210,7 @@ async function main() {
 
   // Créer un serveur HTTP pour servir l'interface et un serveur WebSocket pour relayer les chunks
   const indexHtmlPath = new URL('./index.html', import.meta.url);
+  const assetsPath = new URL('../assets/', import.meta.url);
   const server = http.createServer((req, res) => {
     if (req.url === '/' || req.url === '/index.html') {
       fs.readFile(indexHtmlPath, (err, data) => {
@@ -194,6 +220,32 @@ async function main() {
           return;
         }
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(data);
+      });
+      return;
+    }
+
+    // Servir les fichiers statiques depuis /assets
+    if (req.url?.startsWith('/assets/')) {
+      const filePath = new URL(new URL(req.url.slice(1), assetsPath).toString().replace('/assets/', '/'));
+      fs.readFile(filePath, (err, data) => {
+        if (err) {
+          res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('Fichier non trouvé');
+          return;
+        }
+
+        // Déterminer le type MIME basé sur l'extension
+        const ext = filePath.pathname.split('.').pop()?.toLowerCase();
+        let contentType = 'application/octet-stream';
+        if (ext === 'ttf') contentType = 'font/ttf';
+        else if (ext === 'woff') contentType = 'font/woff';
+        else if (ext === 'woff2') contentType = 'font/woff2';
+
+        res.writeHead(200, {
+          'Content-Type': contentType,
+          'Cache-Control': 'public, max-age=31536000'
+        });
         res.end(data);
       });
       return;
