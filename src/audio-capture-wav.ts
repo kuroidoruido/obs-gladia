@@ -53,20 +53,57 @@ function createWavHeader(dataSize: number): WavHeader {
   return header;
 }
 
-// --- Fonction pour envoyer à Gladia via HTTP ---
-async function sendToGladia(chunk: AudioChunk): Promise<string | null> {
+// --- Fonction pour initialiser une session Gladia et obtenir l'URL WebSocket ---
+async function initializeGladiaSession(): Promise<{ id: string; url: string }> {
   if (!GLADIA_API_KEY) {
-    console.warn("⚠️  Clé API Gladia non définie. Ajoutez GLADIA_API_KEY dans votre fichier .env.");
-    return null;
+    throw new Error("Clé API Gladia non définie");
   }
 
   try {
     const response = await axios.post(
-      'https://api.gladia.io/v2/transcription/',
+      'https://api.gladia.io/v2/live',
       {
-        audio: chunk.toString('base64'),
-        language: 'fr',
-        endpointing: 100,
+        encoding: 'wav/pcm',
+        bit_depth: 16,
+        sample_rate: 16000,
+        channels: 1,
+        custom_metadata: { user: 'OBS Gladia' },
+        model: 'solaria-1',
+        endpointing: 0.05,
+        maximum_duration_without_endpointing: 5,
+        language_config: { languages: ['fr'], code_switching: false },
+        pre_processing: { audio_enhancer: false, speech_threshold: 0.6 },
+        realtime_processing: {
+          custom_vocabulary: false,
+          custom_spelling: false,
+          translation: false,
+          named_entity_recognition: false,
+          sentiment_analysis: false,
+          translation_config: {
+            model: 'base',
+            match_original_utterances: true,
+            lipsync: true,
+            context_adaptation: true,
+            informal: false
+          }
+        },
+        post_processing: {
+          summarization: false,
+          summarization_config: { type: 'general' },
+          chapterization: false
+        },
+        messages_config: {
+          receive_partial_transcripts: true,
+          receive_final_transcripts: true,
+          receive_speech_events: true,
+          receive_pre_processing_events: true,
+          receive_realtime_processing_events: true,
+          receive_post_processing_events: true,
+          receive_acknowledgments: true,
+          receive_errors: true,
+          receive_lifecycle_events: false
+        },
+        callback: false
       },
       {
         headers: {
@@ -76,10 +113,65 @@ async function sendToGladia(chunk: AudioChunk): Promise<string | null> {
       }
     );
 
-    return response.data?.transcription || null;
+    const { id, url } = response.data;
+    console.log(`🔗 Session Gladia initialisée: ${id}`);
+    console.log(`🔗 URL WebSocket: ${url}`);
+
+    return { id, url };
   } catch (error) {
-    console.error("❌ Erreur Gladia :", error);
-    return null;
+    console.error("❌ Erreur lors de l'initialisation de la session Gladia:", error);
+    throw error;
+  }
+}
+
+// --- Fonction pour récupérer le statut d'une session Gladia ---
+async function getGladiaSessionStatus(sessionId: string): Promise<any> {
+  if (!GLADIA_API_KEY) {
+    throw new Error("Clé API Gladia non définie");
+  }
+
+  try {
+    const response = await axios.get(
+      `https://api.gladia.io/v2/live/${sessionId}`,
+      {
+        headers: {
+          'x-gladia-key': GLADIA_API_KEY,
+        },
+      }
+    );
+
+    return response.data;
+  } catch (error) {
+    console.error("❌ Erreur lors de la récupération du statut Gladia:", error);
+    throw error;
+  }
+}
+
+// --- Fonction pour connecter le client WebSocket Gladia ---
+async function connectToGladia(): Promise<{ ws: WebSocket; sessionId: string }> {
+  try {
+    const { id: sessionId, url: wsUrl } = await initializeGladiaSession();
+
+    return new Promise((resolve, reject) => {
+      const gladiaWs = new WebSocket(wsUrl);
+
+      gladiaWs.on('open', () => {
+        console.log('🔗 Connecté au WebSocket Gladia');
+        resolve({ ws: gladiaWs, sessionId });
+      });
+
+      gladiaWs.on('error', (error) => {
+        console.error('❌ Erreur WebSocket Gladia:', error);
+        reject(error);
+      });
+
+      gladiaWs.on('close', () => {
+        console.log('🔌 Déconnecté du WebSocket Gladia');
+      });
+    });
+  } catch (error) {
+    console.error('❌ Erreur lors de la connexion à Gladia:', error);
+    throw error;
   }
 }
 
@@ -93,6 +185,20 @@ async function main() {
   const wss = new WebSocketServer({ port: 8080 });
   console.log(`🚀 Serveur WebSocket démarré sur ws://localhost:8080`);
 
+  // Établir la connexion WebSocket avec Gladia (si pas en mode test)
+  let gladiaWs: WebSocket | null = null;
+  let gladiaSessionId: string | null = null;
+  if (!TEST_MODE) {
+    try {
+      const { ws, sessionId } = await connectToGladia();
+      gladiaWs = ws;
+      gladiaSessionId = sessionId;
+    } catch (error) {
+      console.error('❌ Impossible de se connecter à Gladia:', error);
+      process.exit(1);
+    }
+  }
+
   // Démarrer la capture audio (API correcte : record() puis .start())
   const recording = record.record({
     sampleRate: SAMPLE_RATE,
@@ -102,8 +208,27 @@ async function main() {
     device: AUDIO_SOURCE,
   });
 
-  // Démarrer explicitement la capture
-  recording.start();
+  // Gérer les messages de Gladia
+  if (gladiaWs) {
+    gladiaWs.on('message', (data: Buffer) => {
+      try {
+        const message = JSON.parse(data.toString());
+        console.log('📨 Message Gladia:', message);
+
+        // Relayer les transcriptions aux clients WebSocket
+        if (message.type === 'transcript' && message.transcription) {
+          console.log(`💬 Transcription: ${message.transcription}`);
+          wss.clients.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(JSON.stringify({ text: message.transcription, type: message.type }));
+            }
+          });
+        }
+      } catch (error) {
+        console.error('❌ Erreur parsing message Gladia:', error);
+      }
+    });
+  }
 
   // Récupérer le stream et gérer les données
   const audioStream = recording.stream();
@@ -133,17 +258,10 @@ async function main() {
         }
       });
 
-      // Envoyer à Gladia et relayer la transcription
-      sendToGladia(chunk).then((transcription) => {
-        if (transcription) {
-          console.log(`💬 Transcription: ${transcription}`);
-          wss.clients.forEach((client) => {
-            if (client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify({ text: transcription }));
-            }
-          });
-        }
-      });
+      // Envoyer le chunk audio brut à Gladia via WebSocket
+      if (gladiaWs && gladiaWs.readyState === WebSocket.OPEN) {
+        gladiaWs.send(chunk);
+      }
     }
   });
 
@@ -161,7 +279,7 @@ async function main() {
   });
 
   // Arrêter proprement
-  process.on('SIGINT', () => {
+  process.on('SIGINT', async () => {
     console.log('\n🛑 Arrêt de la capture audio...');
 
     // Écrire le fichier WAV en mode test
@@ -171,6 +289,22 @@ async function main() {
       const fullWavData = Buffer.concat([wavHeader, fullAudioData]);
       fs.writeFileSync(OUTPUT_FILE, fullWavData);
       console.log(`💾 Fichier WAV enregistré : ${OUTPUT_FILE} (${fullAudioData.length} bytes)`);
+    }
+
+    // Récupérer le statut final de la session Gladia
+    if (gladiaSessionId && !TEST_MODE) {
+      try {
+        console.log('📊 Récupération du statut final de la session Gladia...');
+        const status = await getGladiaSessionStatus(gladiaSessionId);
+        console.log('📊 Statut final:', status);
+      } catch (error) {
+        console.error('❌ Erreur lors de la récupération du statut final:', error);
+      }
+    }
+
+    // Fermer la connexion WebSocket Gladia
+    if (gladiaWs) {
+      gladiaWs.close();
     }
 
     recording.stop();
