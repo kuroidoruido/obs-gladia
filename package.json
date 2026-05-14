@@ -1,0 +1,23 @@
+{
+  "name": "obs-gladia",
+  "version": "1.0.0",
+  "description": "",
+  "license": "MIT",
+  "author": "Anthony Pena",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "dotenvx run -- tsx src/audio-capture-wav.ts",
+    "list-audio-devices": "dotenvx run -- tsx src/list-audio-devices.ts"
+  },
+  "dependencies": {
+    "@dotenvx/dotenvx": "^1.66.0",
+    "@types/node": "^25.7.0",
+    "@types/ws": "^8.18.1",
+    "axios": "^1.16.1",
+    "node-record-lpcm16": "^1.0.1",
+    "tsx": "^4.21.0",
+    "websocket": "^1.0.35",
+    "ws": "^8.20.1"
+  }
+}
