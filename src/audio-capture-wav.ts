@@ -1,5 +1,6 @@
 import record from 'node-record-lpcm16';
 import WebSocket, { WebSocketServer } from 'ws';
+import http from 'http';
 import { Buffer } from 'buffer';
 import { config } from '@dotenvx/dotenvx';
 import fs from 'fs';
@@ -28,6 +29,7 @@ const GLADIA_API_KEY = process.env.GLADIA_API_KEY || "";
 
 // Mode test : écrire dans un fichier WAV au lieu d'envoyer à Gladia
 const TEST_MODE = process.env.TEST_MODE === 'true' || false;
+const DEBUG = process.env.DEBUG === 'true' || false;
 const OUTPUT_FILE = process.env.OUTPUT_FILE || 'output.wav';
 
 // --- Types ---
@@ -181,9 +183,30 @@ async function main() {
   let audioBuffer: AudioChunk = Buffer.alloc(0);
   let rawAudioData: Buffer[] = []; // Pour stocker les données audio brutes en mode test
 
-  // Créer un serveur WebSocket pour relayer les chunks
-  const wss = new WebSocketServer({ port: 8080 });
-  console.log(`🚀 Serveur WebSocket démarré sur ws://localhost:8080`);
+  // Créer un serveur HTTP pour servir l'interface et un serveur WebSocket pour relayer les chunks
+  const indexHtmlPath = new URL('./index.html', import.meta.url);
+  const server = http.createServer((req, res) => {
+    if (req.url === '/' || req.url === '/index.html') {
+      fs.readFile(indexHtmlPath, (err, data) => {
+        if (err) {
+          res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('Erreur interne');
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(data);
+      });
+      return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Not found');
+  });
+
+  const wss = new WebSocketServer({ server });
+  server.listen(8080, () => {
+    console.log('🚀 Serveur HTTP + WebSocket démarré sur http://localhost:8080');
+  });
 
   // Établir la connexion WebSocket avec Gladia (si pas en mode test)
   let gladiaWs: WebSocket | null = null;
@@ -213,17 +236,35 @@ async function main() {
     gladiaWs.on('message', (data: Buffer) => {
       try {
         const message = JSON.parse(data.toString());
-        console.log('📨 Message Gladia:', message);
+        DEBUG && console.log('📨 Message Gladia:', message);
 
-        // Relayer les transcriptions aux clients WebSocket
-        if (message.type === 'transcript' && message.transcription) {
-          console.log(`💬 Transcription: ${message.transcription}`);
-          wss.clients.forEach((client) => {
-            if (client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify({ text: message.transcription, type: message.type }));
-            }
-          });
+        const isTranscript =
+          message.type === 'transcript' || message.event === 'transcript';
+
+        if (!isTranscript) {
+          return;
         }
+
+        const text =
+          message.transcription ||
+          message.data?.utterance?.text ||
+          message.data?.utterance?.text ||
+          null;
+
+        if (!text) {
+          return;
+        }
+
+        console.log(`💬 Transcription: ${text}`);
+        const payload = {
+          text,
+          type: message.event || message.type || 'transcript',
+        };
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify(payload));
+          }
+        });
       } catch (error) {
         console.error('❌ Erreur parsing message Gladia:', error);
       }
@@ -246,17 +287,6 @@ async function main() {
         rawAudioData.push(chunk);
         return;
       }
-
-      // Créer un chunk WAV
-      const wavHeader = createWavHeader(chunk.length);
-      const wavChunk = Buffer.concat([wavHeader, chunk]);
-
-      // Envoyer le chunk WAV aux clients WebSocket
-      wss.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(wavChunk);
-        }
-      });
 
       // Envoyer le chunk audio brut à Gladia via WebSocket
       if (gladiaWs && gladiaWs.readyState === WebSocket.OPEN) {
@@ -309,6 +339,7 @@ async function main() {
 
     recording.stop();
     wss.close();
+    server.close();
     process.exit();
   });
 
